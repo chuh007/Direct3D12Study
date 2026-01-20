@@ -33,6 +33,17 @@ enum class RenderLayer : int
 	Transparent,
 	AlphaTested,
 	Skybox,
+	QuadPatch,
+	Tree,
+	ShadowMap,
+	ShadowMapDebug,
+	Count
+};
+
+enum class ETextureType : int
+{
+	Texture2D = 0,
+	Texture2DArray,
 	Count
 };
 
@@ -43,6 +54,19 @@ struct Vertex
 	XMFLOAT3 Normal;
 	XMFLOAT2 Uv;
 	XMFLOAT3 TangentU;
+};
+
+// 바닥 정점 구조체
+struct QuadPatchVertex
+{
+	XMFLOAT3 Pos;
+};
+
+// 나무 정점 구조체
+struct TreeVertex
+{
+	XMFLOAT3 Pos;
+	XMFLOAT2 Size;
 };
 
 // 오브젝트 구조체
@@ -74,6 +98,8 @@ struct TextureInfo
 
 	UINT TextureHeapIndex = 0;
 
+	ETextureType TextureType = ETextureType::Texture2D;
+
 	ComPtr<ID3D12Resource> Resource = nullptr;
 	ComPtr<ID3D12Resource> UploadHeap = nullptr;
 };
@@ -102,6 +128,9 @@ struct RenderItem
 
 	XMFLOAT4X4 World = MathHelper::Identity4x4();
 	XMFLOAT4X4 TextureTransform = MathHelper::Identity4x4();
+
+	// Primitive Topology
+	D3D12_PRIMITIVE_TOPOLOGY PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
 	GeometryInfo* Geometry = nullptr;
 	MaterialInfo* Material = nullptr;
@@ -137,6 +166,7 @@ struct PassConstant
 	XMFLOAT4X4	Proj = MathHelper::Identity4x4();
 	XMFLOAT4X4	InvProj = MathHelper::Identity4x4();
 	XMFLOAT4X4	ViewProj = MathHelper::Identity4x4();
+	XMFLOAT4X4	ShadowTransform = MathHelper::Identity4x4();
 
 	XMFLOAT4	AmbientLight = { 0.0f, 0.0f, 0.0f, 1.0f };
 	XMFLOAT3	EyePosW = { 0.0f, 0.0f, 0.0f };

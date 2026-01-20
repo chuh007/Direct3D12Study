@@ -26,12 +26,14 @@ private:
 #pragma region Rendering Geometry
 
 public:
+	void BuildShadowMap();
 	void BuildGeometry();
 	void BuildTextures();
 	void BuildMaterials();
 	void BuildRenderItems();
 	void BuildConstantBuffer();
 	void BuildDescriptorHeap();
+	void BuildDsvDescriptorHeap();
 	void BuildShader();
 	void BuildRootSignature();
 	void BuildInputLayout();
@@ -43,14 +45,23 @@ private:
 	void CreateSphereGeometry();
 	void CreateCylinderGeometry();
 	void CreateSkullGeometry();
+	void CreateQuadPatchGeometry();
+	void CreateTreeGeometry();
+	void CreateQuadGeometry();
 
 public:
 	void UpdateObjectCB(float deltaTime);
 	void UpdatePassCB(float deltaTime);
 	void UpdateMaterialCB(float deltaTime);
+	void UpdateShadowMapPassCB(float deltaTime);
+
+	void UpdateCamera(float deltaTime);
+	void UpdateLight(float deltaTime);
 
 	void RenderGeometry();
 	void RenderGeometry(const std::vector<RenderItem*>& RenderItems);
+
+	void RenderSceneToShadowMap();
 
 private:
 	// 기하도형 맵
@@ -95,19 +106,54 @@ private:
 	// 입력 배치
 	std::vector<D3D12_INPUT_ELEMENT_DESC> m_InputLayout;
 
+	// 바닥 입력 배치
+	std::vector<D3D12_INPUT_ELEMENT_DESC> m_QuadPatchInputLayout;
+
+	// 나무 입력 배치
+	std::vector<D3D12_INPUT_ELEMENT_DESC> m_TreeInputLayout;
+
 	// 셰이더 맵
 	std::unordered_map<std::wstring, ComPtr<ID3DBlob>> m_Shaders;
 
 	// 렌더링 파이프라인 맵
 	std::unordered_map<RenderLayer, ComPtr<ID3D12PipelineState>> m_PipelineStates;
 
+// 쉐도우 맵 정보
 private:
-	// 시야 행렬, 투영 행렬
-	XMFLOAT4X4 m_View = MathHelper::Identity4x4();
-	XMFLOAT4X4 m_Proj = MathHelper::Identity4x4();
+	// ShadowMap 텍스쳐 인덱스
+	ComPtr<ID3D12Resource>			m_ShadowMapResource = nullptr;
+	CD3DX12_CPU_DESCRIPTOR_HANDLE	m_hShadowMapDsv;
+	CD3DX12_CPU_DESCRIPTOR_HANDLE	m_hShadowMapSrv;
 
-	// 카메라 위치 
-	XMFLOAT3 m_EyePos = { 0.0f, 0.0f, 0.0f };
+	// ShadowMap 텍스쳐 인덱스
+	UINT							m_ShadowMapHeapIndex = 0;
+
+	D3D12_VIEWPORT	m_ShadowMapViewport;
+	D3D12_RECT		m_ShadowMapSicssorRect;
+
+	UINT			m_ShadowMapWidth = 2048;
+	UINT			m_ShadowMapHeight = 2048;
+
+private:
+	// 카메라 클래스
+	Camera m_Camera;
+	
+	// 라이트 정보
+	XMFLOAT3 m_BaseLightDirection = XMFLOAT3(0.57735f, -0.57735f, 0.57735f);
+	XMFLOAT3 m_RotatedLightDirection;
+	float m_LightRotationAngle = 0.0f;
+	float m_LightRotationSpeed = 0.1f;
+
+	// 라이트 행렬
+	float m_LightNearZ = 0.0f;
+	float m_LighFarZ = 0.0f;
+	XMFLOAT3 m_LightPosW;
+	XMFLOAT4X4 m_LightView = MathHelper::Identity4x4();
+	XMFLOAT4X4 m_LightProj = MathHelper::Identity4x4();
+	XMFLOAT4X4 m_ShadowTransform = MathHelper::Identity4x4();
+
+	// 경계 구
+	BoundingSphere m_SceneBounds;
 
 	// 구면 좌표 제어 값
 	float m_Theta = 1.5f * XM_PI;

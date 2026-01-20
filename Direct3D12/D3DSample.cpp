@@ -17,6 +17,16 @@ bool D3DSample::Initialize()
     ThrowIfFailed(m_CommandAlloc->Reset());
     ThrowIfFailed(m_CommandList->Reset(m_CommandAlloc.Get(), nullptr));
 
+    // Camera Initialize
+    m_Camera.SetPosition(0.0f, 2.0f, -15.0f);
+
+    // Bounds Initialize
+    m_SceneBounds.Center = XMFLOAT3(0.0f, 0.0f, 0.0f);
+    m_SceneBounds.Radius = sqrtf(10.0f * 10.0f + 15.0f * 15.0f);
+
+    // ShadowMap Initialize
+    BuildShadowMap();
+
     // Rendering Geometry
     BuildGeometry();
     BuildTextures();
@@ -24,6 +34,7 @@ bool D3DSample::Initialize()
     BuildRenderItems();
     BuildConstantBuffer();
     BuildDescriptorHeap();
+    BuildDsvDescriptorHeap();
     BuildShader();
     BuildRootSignature();
     BuildInputLayout();
@@ -42,8 +53,7 @@ void D3DSample::OnResize()
 {
     D3DRenderer::OnResize();
 
-    XMMATRIX Proj = XMMatrixPerspectiveFovLH(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
-    XMStoreFloat4x4(&m_Proj, Proj);
+    m_Camera.SetLens(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
 }
 
 void D3DSample::Update(float deltaTime)
@@ -54,19 +64,11 @@ void D3DSample::Update(float deltaTime)
 
 void D3DSample::LateUpdate(float deltaTime)
 {
-    m_EyePos.x = m_Radius * sinf(m_Phi) * cosf(m_Theta);
-    m_EyePos.y = m_Radius * cosf(m_Phi);
-    m_EyePos.z = m_Radius * sinf(m_Phi) * sinf(m_Theta);
-
-    // 시야 행렬 
-    XMVECTOR EyePos = XMVectorSet(m_EyePos.x, m_EyePos.y, m_EyePos.z, 1.0f);
-    XMVECTOR Target = XMVectorZero();
-    XMVECTOR Up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-
-    XMMATRIX View = XMMatrixLookAtLH(EyePos, Target, Up);
-    XMStoreFloat4x4(&m_View, View);
-
+    UpdateLight(deltaTime);
+    UpdateCamera(deltaTime);
+    
     UpdatePassCB(deltaTime);
+    UpdateShadowMapPassCB(deltaTime);
 }
 
 void D3DSample::BeginRender()
@@ -75,6 +77,15 @@ void D3DSample::BeginRender()
 
     ThrowIfFailed(m_CommandList->Reset(m_CommandAlloc.Get(), nullptr));
 
+    
+}
+
+void D3DSample::Render()
+{
+    // 패스 1 : 쉐도우 맵 렌더링
+    RenderSceneToShadowMap();
+
+    // 패스 2 : 오브젝트 렌더링
     m_CommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
 
     m_CommandList->RSSetViewports(1, &m_ScreenViewport);
@@ -84,10 +95,7 @@ void D3DSample::BeginRender()
     m_CommandList->ClearDepthStencilView(GetDepthStencilView(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 
     m_CommandList->OMSetRenderTargets(1, &GetRenderTargetView(), true, &GetDepthStencilView());
-}
 
-void D3DSample::Render()
-{
     m_CommandList->SetGraphicsRootSignature(m_RootSignature.Get());
 
     // 텍스처 서술자 렌더링 파이프라인에 묶기
@@ -101,8 +109,12 @@ void D3DSample::Render()
     // 스카이박스 텍스처 렌더링 파이프라인에 묶기
     CD3DX12_GPU_DESCRIPTOR_HANDLE SkyboxHeapAddress(m_TextureDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
     SkyboxHeapAddress.Offset(m_SkyboxTexture->TextureHeapIndex, m_CbvSrvUavDescriptorSize);
-
     m_CommandList->SetGraphicsRootDescriptorTable(4, SkyboxHeapAddress);
+
+    // 쉐도우 맵 텍스쳐 렌더링 파이프라인에 묶기
+    CD3DX12_GPU_DESCRIPTOR_HANDLE ShadowHeapAddress(m_TextureDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+    ShadowHeapAddress.Offset(m_ShadowMapHeapIndex, m_CbvSrvUavDescriptorSize);
+    m_CommandList->SetGraphicsRootDescriptorTable(5, ShadowHeapAddress);
 
     // 스카이박스 오브젝트 렌더링
     m_CommandList->SetPipelineState(m_PipelineStates[RenderLayer::Skybox].Get());
@@ -112,13 +124,25 @@ void D3DSample::Render()
     m_CommandList->SetPipelineState(m_PipelineStates[RenderLayer::Opaque].Get());
     RenderGeometry(m_RenderItemLayer[(int)RenderLayer::Opaque]);
 
+    // 바닥 오브젝트 렌더링
+    m_CommandList->SetPipelineState(m_PipelineStates[RenderLayer::QuadPatch].Get());
+    RenderGeometry(m_RenderItemLayer[(int)RenderLayer::QuadPatch]);
+
     // AlphaTested 오브젝트 렌더링
     m_CommandList->SetPipelineState(m_PipelineStates[RenderLayer::AlphaTested].Get());
     RenderGeometry(m_RenderItemLayer[(int)RenderLayer::AlphaTested]);
 
+    // 나무 오브젝트 렌더링
+    m_CommandList->SetPipelineState(m_PipelineStates[RenderLayer::Tree].Get());
+    RenderGeometry(m_RenderItemLayer[(int)RenderLayer::Tree]);
+
     // Transparent 오브젝트 렌더링
     m_CommandList->SetPipelineState(m_PipelineStates[RenderLayer::Transparent].Get());
     RenderGeometry(m_RenderItemLayer[(int)RenderLayer::Transparent]);
+
+    // ShadowMapDebug 오브젝트 렌더링
+    m_CommandList->SetPipelineState(m_PipelineStates[RenderLayer::ShadowMapDebug].Get());
+    RenderGeometry(m_RenderItemLayer[(int)RenderLayer::ShadowMapDebug]);
 }
 
 void D3DSample::EndRender()
@@ -156,23 +180,47 @@ void D3DSample::OnMouseMove(WPARAM btnState, int x, int y)
         float dx = XMConvertToRadians(0.25f * static_cast<float>(x - m_LastMousePos.x));
         float dy = XMConvertToRadians(0.25f * static_cast<float>(y - m_LastMousePos.y));
 
-        m_Theta += dx;
-        m_Phi += dy;
-
-        m_Phi = MathHelper::Clamp(m_Phi, 0.1f, MathHelper::Pi - 0.1f);
-    }
-    else if ((btnState & MK_RBUTTON) != 0)
-    {
-        float dx = 0.2f * static_cast<float>(x - m_LastMousePos.x);
-        float dy = 0.2f * static_cast<float>(y - m_LastMousePos.y);
-
-        m_Radius += dx - dy;
-
-        m_Radius = MathHelper::Clamp(m_Radius, 3.0f, 150.0f);
+        m_Camera.RotateY(dx);
+        m_Camera.Pitch(dy);
     }
 
     m_LastMousePos.x = x;
     m_LastMousePos.y = y;
+}
+
+void D3DSample::BuildShadowMap()
+{
+    m_ShadowMapViewport = { 0.0f, 0.0f, (float)m_ShadowMapWidth, (float)m_ShadowMapHeight, 0.0f, 1.0f };
+    m_ShadowMapSicssorRect = { 0, 0, (int)m_ShadowMapWidth, (int)m_ShadowMapHeight };
+
+    D3D12_RESOURCE_DESC TexDesc;
+    ZeroMemory(&TexDesc, sizeof(D3D12_RESOURCE_DESC));
+
+    TexDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    TexDesc.Alignment = 0;
+    TexDesc.Width = m_ShadowMapWidth;
+    TexDesc.Height= m_ShadowMapHeight;
+    TexDesc.DepthOrArraySize = 1;
+    TexDesc.MipLevels = 1;
+    TexDesc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    TexDesc.SampleDesc.Count = 1;
+    TexDesc.SampleDesc.Quality = 0;
+    TexDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    TexDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE OptClear;
+    OptClear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    OptClear.DepthStencil.Depth = 1.0f;
+    OptClear.DepthStencil.Stencil = 0;
+
+    ThrowIfFailed(m_D3dDevice->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+        D3D12_HEAP_FLAG_NONE,
+        &TexDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        &OptClear,
+        IID_PPV_ARGS(&m_ShadowMapResource)))
+        ;
 }
 
 void D3DSample::BuildGeometry()
@@ -182,6 +230,9 @@ void D3DSample::BuildGeometry()
     CreateSphereGeometry();
     CreateCylinderGeometry();
     CreateSkullGeometry();
+    CreateQuadPatchGeometry();
+    CreateTreeGeometry();
+    CreateQuadGeometry();
 }
 
 void D3DSample::BuildTextures()
@@ -260,6 +311,22 @@ void D3DSample::BuildTextures()
         FenceTexture->UploadHeap));
     m_Textures[FenceTexture->Name] = std::move(FenceTexture);
 
+
+    auto TreeTexture = std::make_unique<TextureInfo>();
+    TreeTexture->Name = TEXT("TreeTexture");
+    TreeTexture->FileName = TEXT("../Textures/treearray.dds");
+    TreeTexture->TextureHeapIndex = TextureHeapIndex++;
+    TreeTexture->TextureType = ETextureType::Texture2DArray;
+    ThrowIfFailed(DirectX::CreateDDSTextureFromFile12(
+        m_D3dDevice.Get(),
+        m_CommandList.Get(),
+        TreeTexture->FileName.c_str(),
+        TreeTexture->Resource,
+        TreeTexture->UploadHeap));
+    m_Textures[TreeTexture->Name] = std::move(TreeTexture);
+
+
+    // 스카이박스는 모든 텍스처 배열 다음에 추가한 개별 텍스처
     // 스카이박스 텍스처 생성하기
     m_SkyboxTexture = std::make_unique<TextureInfo>();
     m_SkyboxTexture->Name = TEXT("Skybox");
@@ -344,6 +411,17 @@ void D3DSample::BuildMaterials()
     Mirror->Fresnel = XMFLOAT3(0.98f, 0.97f, 0.95f);
     Mirror->Roughness = 0.1f;
     m_Materials[Mirror->Name] = std::move(Mirror);
+
+    // 나무 재질
+    auto Tree = std::make_unique<MaterialInfo>();
+    Tree->Name = TEXT("Tree");
+    Tree->MatCBIndex = MatCBIndex++;
+    Tree->Texture_On = 1;
+    Tree->TextureHeapIndex = m_Textures[TEXT("TreeTexture")]->TextureHeapIndex;
+    Tree->Albedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+    Tree->Fresnel = XMFLOAT3(0.1f, 0.1f, 0.1f);
+    Tree->Roughness = 0.1f;
+    m_Materials[Tree->Name] = std::move(Tree);
 }
 
 void D3DSample::BuildRenderItems()
@@ -372,7 +450,7 @@ void D3DSample::BuildRenderItems()
     XMStoreFloat4x4(&SkullItem->World, XMMatrixScaling(0.5f, 0.5f, 0.5f) * XMMatrixTranslation(0.0f, 1.0f, 0.0f));
     SkullItem->Geometry = m_Geometries[TEXT("Skull")].get();
     SkullItem->Material = m_Materials[TEXT("Skull")].get();
-    m_RenderItemLayer[(int)RenderLayer::Transparent].push_back(SkullItem.get());
+    m_RenderItemLayer[(int)RenderLayer::Opaque].push_back(SkullItem.get());
     m_RenderItems.push_back(std::move(SkullItem));
 
     for (int i = 0; i < 5; ++i)
@@ -425,6 +503,35 @@ void D3DSample::BuildRenderItems()
     SkyboxItem->Material = m_Materials[TEXT("Skybox")].get();
     m_RenderItemLayer[(int)RenderLayer::Skybox].push_back(SkyboxItem.get());
     m_RenderItems.push_back(std::move(SkyboxItem));
+
+    // 쉐도우 맵 텍스쳐 쿼드 오브젝트 생성
+    auto QuadItem = std::make_unique<RenderItem>();
+    QuadItem->ObjectCBIndex = ObjectCBIndex++;
+    QuadItem->World = MathHelper::Identity4x4();
+    QuadItem->Geometry = m_Geometries[TEXT("Quad")].get();
+    QuadItem->Material = m_Materials[TEXT("Tile")].get();
+    m_RenderItemLayer[(int)RenderLayer::ShadowMapDebug].push_back(QuadItem.get());
+    m_RenderItems.push_back(std::move(QuadItem));
+
+    //// 바닥 오브젝트 생성
+    //auto QuadPathItem = std::make_unique<RenderItem>();
+    //QuadPathItem->ObjectCBIndex = ObjectCBIndex++;
+    //QuadPathItem->World = MathHelper::Identity4x4();
+    //QuadPathItem->Geometry = m_Geometries[TEXT("QuadPatch")].get();
+    //QuadPathItem->Material = m_Materials[TEXT("Tile")].get();
+    //QuadPathItem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST;
+    //m_RenderItemLayer[(int)RenderLayer::QuadPatch].push_back(QuadPathItem.get());
+    //m_RenderItems.push_back(std::move(QuadPathItem));
+
+    //// 나무 오브젝트 생성
+    //auto TreeItem = std::make_unique<RenderItem>();
+    //TreeItem->ObjectCBIndex = ObjectCBIndex++;
+    //TreeItem->World = MathHelper::Identity4x4();
+    //TreeItem->Geometry = m_Geometries[TEXT("Tree")].get();
+    //TreeItem->Material = m_Materials[TEXT("Tree")].get();
+    //TreeItem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
+    //m_RenderItemLayer[(int)RenderLayer::Tree].push_back(TreeItem.get());
+    //m_RenderItems.push_back(std::move(TreeItem));
 }
 
 void D3DSample::BuildConstantBuffer()
@@ -448,7 +555,7 @@ void D3DSample::BuildConstantBuffer()
 
     // 공용 상수 버퍼 생성
     UINT PassSize = sizeof(PassConstant);
-    m_PassByteSize = (PassSize + 255) & ~255;
+    m_PassByteSize = ((PassSize + 255) & ~255) * 2;
 
     D3D12_RESOURCE_DESC PassDesc = CD3DX12_RESOURCE_DESC::Buffer(m_PassByteSize);
     D3D12_HEAP_PROPERTIES PassHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
@@ -486,9 +593,9 @@ void D3DSample::BuildConstantBuffer()
 void D3DSample::BuildDescriptorHeap()
 {
     // SRV Heap
-    // 텍스처 맵 갯수 + 스카이박스 텍스처 갯수
+    // 텍스처 맵 갯수 + 스카이박스 텍스처 갯수 + 쉐도우 맵 텍스쳐 갯수
     D3D12_DESCRIPTOR_HEAP_DESC TextureHeapDesc = {};
-    TextureHeapDesc.NumDescriptors = m_Textures.size() + 1;
+    TextureHeapDesc.NumDescriptors = m_Textures.size() + 1 + 1;
     TextureHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     TextureHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(m_D3dDevice->CreateDescriptorHeap(&TextureHeapDesc, IID_PPV_ARGS(&m_TextureDescriptorHeap)));
@@ -504,10 +611,23 @@ void D3DSample::BuildDescriptorHeap()
         D3D12_SHADER_RESOURCE_VIEW_DESC TexDesc = {};
         TexDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         TexDesc.Format = TexResource->GetDesc().Format;
-        TexDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        TexDesc.Texture2D.MostDetailedMip = 0;
-        TexDesc.Texture2D.MipLevels = TexResource->GetDesc().MipLevels;
-        TexDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+
+        switch (TexInfo->TextureType)
+        {
+        case ETextureType::Texture2D:
+            TexDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            TexDesc.Texture2D.MostDetailedMip = 0;
+            TexDesc.Texture2D.MipLevels = TexResource->GetDesc().MipLevels;
+            TexDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+            break;
+        case ETextureType::Texture2DArray:
+            TexDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            TexDesc.Texture2DArray.MostDetailedMip = 0;
+            TexDesc.Texture2DArray.MipLevels = -1;
+            TexDesc.Texture2DArray.FirstArraySlice = 0;
+            TexDesc.Texture2DArray.ArraySize = TexResource->GetDesc().DepthOrArraySize;
+            break;
+        }        
 
         m_D3dDevice->CreateShaderResourceView(TexResource.Get(), &TexDesc, hDescriptor);
     }
@@ -526,6 +646,38 @@ void D3DSample::BuildDescriptorHeap()
     SkyboxDesc.TextureCube.ResourceMinLODClamp = 0.0f;
 
     m_D3dDevice->CreateShaderResourceView(SkyboxResource.Get(), &SkyboxDesc, hDescriptor);
+
+
+    // 쉐도우 맵 텍스쳐 힙
+    m_ShadowMapHeapIndex = (UINT)m_SkyboxTexture->TextureHeapIndex + 1;
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE hSrvDescriptor(m_TextureDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+    hSrvDescriptor.Offset(m_ShadowMapHeapIndex, m_CbvSrvUavDescriptorSize);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC ShadowMapDesc;
+    ShadowMapDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    ShadowMapDesc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;   
+    ShadowMapDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    ShadowMapDesc.Texture2D.MostDetailedMip = 0;
+    ShadowMapDesc.Texture2D.MipLevels = 1;
+    ShadowMapDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+    ShadowMapDesc.Texture2D.PlaneSlice = 0;
+
+    m_D3dDevice->CreateShaderResourceView(m_ShadowMapResource.Get(), &ShadowMapDesc, hSrvDescriptor);
+}
+
+void D3DSample::BuildDsvDescriptorHeap()
+{
+    D3D12_DEPTH_STENCIL_VIEW_DESC DsvDesc;
+    DsvDesc.Flags = D3D12_DSV_FLAG_NONE;
+    DsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    DsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    DsvDesc.Texture2D.MipSlice = 0;
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE hDsvDescriptor(m_DsvHeap->GetCPUDescriptorHandleForHeapStart());
+    m_hShadowMapDsv = CD3DX12_CPU_DESCRIPTOR_HANDLE(hDsvDescriptor, 1, m_DsvDescriptorSize);
+
+    m_D3dDevice->CreateDepthStencilView(m_ShadowMapResource.Get(), &DsvDesc, m_hShadowMapDsv);
 }
 
 void D3DSample::BuildShader()
@@ -548,6 +700,22 @@ void D3DSample::BuildShader()
 
     m_Shaders[TEXT("SkyboxVS")] = d3dUtil::CompileShader(TEXT("../Shader/Skybox.hlsl"), nullptr, "VS", "vs_5_0");
     m_Shaders[TEXT("SkyboxPS")] = d3dUtil::CompileShader(TEXT("../Shader/Skybox.hlsl"), nullptr, "PS", "ps_5_0");
+
+    m_Shaders[TEXT("TessVS")] = d3dUtil::CompileShader(TEXT("../Shader/QuadPatch.hlsl"), nullptr, "VS", "vs_5_0");
+    m_Shaders[TEXT("TessHS")] = d3dUtil::CompileShader(TEXT("../Shader/QuadPatch.hlsl"), nullptr, "HS", "hs_5_0");
+    m_Shaders[TEXT("TessDS")] = d3dUtil::CompileShader(TEXT("../Shader/QuadPatch.hlsl"), nullptr, "DS", "ds_5_0");
+    m_Shaders[TEXT("TessPS")] = d3dUtil::CompileShader(TEXT("../Shader/QuadPatch.hlsl"), nullptr, "PS", "ps_5_0");
+
+    m_Shaders[TEXT("TreeVS")] = d3dUtil::CompileShader(TEXT("../Shader/Tree.hlsl"), nullptr, "VS", "vs_5_0");
+    m_Shaders[TEXT("TreeGS")] = d3dUtil::CompileShader(TEXT("../Shader/Tree.hlsl"), nullptr, "GS", "gs_5_0");
+    m_Shaders[TEXT("TreePS")] = d3dUtil::CompileShader(TEXT("../Shader/Tree.hlsl"), AlphaTestedDefines, "PS", "ps_5_0");
+
+    m_Shaders[TEXT("ShadowVS")] = d3dUtil::CompileShader(TEXT("../Shader/ShadowMap.hlsl"), nullptr, "VS", "vs_5_0");
+    m_Shaders[TEXT("ShadowPS")] = d3dUtil::CompileShader(TEXT("../Shader/ShadowMap.hlsl"), nullptr, "PS", "ps_5_0");
+
+    m_Shaders[TEXT("DebugVS")] = d3dUtil::CompileShader(TEXT("../Shader/ShadowMapDebug.hlsl"), nullptr, "VS", "vs_5_0");
+    m_Shaders[TEXT("DebugPS")] = d3dUtil::CompileShader(TEXT("../Shader/ShadowMapDebug.hlsl"), nullptr, "PS", "ps_5_0");
+
 }
 
 void D3DSample::BuildRootSignature()
@@ -559,16 +727,40 @@ void D3DSample::BuildRootSignature()
     CD3DX12_DESCRIPTOR_RANGE SkyboxTable[1];
     SkyboxTable[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2 : Skybox Texture
 
-    CD3DX12_ROOT_PARAMETER Params[5];
+    CD3DX12_DESCRIPTOR_RANGE ShadowMapTable[1];
+    ShadowMapTable[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3); // t3 : ShadowMap Texture
+
+    CD3DX12_ROOT_PARAMETER Params[6];
     Params[0].InitAsConstantBufferView(0); // 0번 -> b0 : CBV m_ObjectCB
     Params[1].InitAsConstantBufferView(1); // 1번 -> b1 : CBV m_PassCB
     Params[2].InitAsConstantBufferView(2); // 2번 -> b2 : CBV m_MaterialCB
-    Params[3].InitAsDescriptorTable(_countof(TextureTable), TextureTable); // 3번 -> TexTable
-    Params[4].InitAsDescriptorTable(_countof(SkyboxTable), SkyboxTable); // 4번 -> Skybox Table
+    Params[3].InitAsDescriptorTable(_countof(TextureTable), TextureTable);      // 3번 -> t0, t1 TexTable
+    Params[4].InitAsDescriptorTable(_countof(SkyboxTable), SkyboxTable);        // 4번 -> t2, Skybox Table
+    Params[5].InitAsDescriptorTable(_countof(ShadowMapTable), ShadowMapTable);  // 5번 -> t3, ShadowMap Table
 
-    D3D12_STATIC_SAMPLER_DESC SamplerDesc = CD3DX12_STATIC_SAMPLER_DESC(0); // s0 : Sampler
+    const CD3DX12_STATIC_SAMPLER_DESC pointWrap(
+        0, // s0
+        D3D12_FILTER_MIN_MAG_MIP_POINT,     //filter
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP,    // addressU
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP,    // addressV
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP     // addressW
+    );
 
-    D3D12_ROOT_SIGNATURE_DESC RSDesc = CD3DX12_ROOT_SIGNATURE_DESC(_countof(Params), Params, 1, &SamplerDesc);
+    const CD3DX12_STATIC_SAMPLER_DESC shadowMap(
+        1, // s1
+        D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT,   //filter
+        D3D12_TEXTURE_ADDRESS_MODE_BORDER,                  // addressU
+        D3D12_TEXTURE_ADDRESS_MODE_BORDER,                  // addressV
+        D3D12_TEXTURE_ADDRESS_MODE_BORDER,                  // addressW
+        0.0f,
+        16,
+        D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK
+    );
+    std::array<const CD3DX12_STATIC_SAMPLER_DESC, 2> staticSamplers = { pointWrap, shadowMap };
+
+    D3D12_ROOT_SIGNATURE_DESC RSDesc = CD3DX12_ROOT_SIGNATURE_DESC(_countof(Params), Params, staticSamplers.size(), staticSamplers.data());
+
     RSDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     ComPtr<ID3DBlob> BlobSignature;
@@ -586,6 +778,17 @@ void D3DSample::BuildInputLayout()
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"TANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+
+    m_QuadPatchInputLayout =
+    {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+
+    m_TreeInputLayout =
+    {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"SIZE", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
     };
 }
 
@@ -671,6 +874,95 @@ void D3DSample::BuildPipelineState()
     };
 
     ThrowIfFailed(m_D3dDevice->CreateGraphicsPipelineState(&SkyboxDesc, IID_PPV_ARGS(&m_PipelineStates[RenderLayer::Skybox])));
+
+    // PSO : QuadPatch Objects
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC QuadPatchDesc = ObjectDesc;
+    QuadPatchDesc.VS =
+    {
+        reinterpret_cast<BYTE*>(m_Shaders[TEXT("TessVS")]->GetBufferPointer()),
+        m_Shaders[TEXT("TessVS")]->GetBufferSize()
+    };
+    QuadPatchDesc.HS =
+    {
+        reinterpret_cast<BYTE*>(m_Shaders[TEXT("TessHS")]->GetBufferPointer()),
+        m_Shaders[TEXT("TessHS")]->GetBufferSize()
+    };
+    QuadPatchDesc.DS =
+    {
+        reinterpret_cast<BYTE*>(m_Shaders[TEXT("TessDS")]->GetBufferPointer()),
+        m_Shaders[TEXT("TessDS")]->GetBufferSize()
+    };
+    QuadPatchDesc.PS =
+    {
+        reinterpret_cast<BYTE*>(m_Shaders[TEXT("TessPS")]->GetBufferPointer()),
+        m_Shaders[TEXT("TessPS")]->GetBufferSize()
+    };
+
+    QuadPatchDesc.InputLayout = { m_QuadPatchInputLayout.data(), (UINT)m_QuadPatchInputLayout.size() };
+    QuadPatchDesc.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    QuadPatchDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+
+    ThrowIfFailed(m_D3dDevice->CreateGraphicsPipelineState(&QuadPatchDesc, IID_PPV_ARGS(&m_PipelineStates[RenderLayer::QuadPatch])));
+
+    // PSO : Tree Objects
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC TreeDesc = ObjectDesc;
+    TreeDesc.VS =
+    {
+        reinterpret_cast<BYTE*>(m_Shaders[TEXT("TreeVS")]->GetBufferPointer()),
+        m_Shaders[TEXT("TreeVS")]->GetBufferSize()
+    };
+    TreeDesc.GS =
+    {
+        reinterpret_cast<BYTE*>(m_Shaders[TEXT("TreeGS")]->GetBufferPointer()),
+        m_Shaders[TEXT("TreeGS")]->GetBufferSize()
+    };
+    TreeDesc.PS =
+    {
+        reinterpret_cast<BYTE*>(m_Shaders[TEXT("TreePS")]->GetBufferPointer()),
+        m_Shaders[TEXT("TreePS")]->GetBufferSize()
+    };
+
+    TreeDesc.InputLayout = { m_TreeInputLayout.data(), (UINT)m_TreeInputLayout.size() };
+    TreeDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    TreeDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+
+    ThrowIfFailed(m_D3dDevice->CreateGraphicsPipelineState(&TreeDesc, IID_PPV_ARGS(&m_PipelineStates[RenderLayer::Tree])));
+
+    // PSO : ShadowMap Objects
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC ShadowMapDesc = ObjectDesc;
+    ShadowMapDesc.VS =
+    {
+        reinterpret_cast<BYTE*>(m_Shaders[TEXT("ShadowVS")]->GetBufferPointer()),
+        m_Shaders[TEXT("ShadowVS")]->GetBufferSize()
+    };
+    ShadowMapDesc.PS =
+    {
+        reinterpret_cast<BYTE*>(m_Shaders[TEXT("ShadowPS")]->GetBufferPointer()),
+        m_Shaders[TEXT("ShadowPS")]->GetBufferSize()
+    };
+
+    ShadowMapDesc.RasterizerState.DepthBias = 100000;
+    ShadowMapDesc.RasterizerState.DepthBiasClamp = 0.0f;
+    ShadowMapDesc.RasterizerState.SlopeScaledDepthBias = 1.0f;
+    ShadowMapDesc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+    ShadowMapDesc.NumRenderTargets = 0;
+
+    ThrowIfFailed(m_D3dDevice->CreateGraphicsPipelineState(&ShadowMapDesc, IID_PPV_ARGS(&m_PipelineStates[RenderLayer::ShadowMap])));
+
+    // PSO : ShadowMapDebug Objects
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC DebugDesc = ObjectDesc;
+    DebugDesc.VS =
+    {
+        reinterpret_cast<BYTE*>(m_Shaders[TEXT("DebugVS")]->GetBufferPointer()),
+        m_Shaders[TEXT("DebugVS")]->GetBufferSize()
+    };
+    DebugDesc.PS =
+    {
+        reinterpret_cast<BYTE*>(m_Shaders[TEXT("DebugPS")]->GetBufferPointer()),
+        m_Shaders[TEXT("DebugPS")]->GetBufferSize()
+    };
+    ThrowIfFailed(m_D3dDevice->CreateGraphicsPipelineState(&DebugDesc, IID_PPV_ARGS(&m_PipelineStates[RenderLayer::ShadowMapDebug])));
+
 }
 
 void D3DSample::CreateBoxGeometry()
@@ -908,6 +1200,134 @@ void D3DSample::CreateSkullGeometry()
     m_Geometries[Geometry->Name] = std::move(Geometry);
 }
 
+void D3DSample::CreateQuadPatchGeometry()
+{
+    std::array<QuadPatchVertex, 4> Vertices =
+    {
+        XMFLOAT3(-50.0f, 0.0f, +50.0f),
+        XMFLOAT3(+50.0f, 0.0f, +50.0f),
+        XMFLOAT3(-50.0f, 0.0f, -50.0f),
+        XMFLOAT3(+50.0f, 0.0f, -50.0f),
+    };
+
+    std::array<std::int32_t, 4> Indices = { 0, 1, 2, 3 };
+
+    auto Geometry = std::make_unique<GeometryInfo>();
+    Geometry->Name = TEXT("QuadPatch");
+
+    // 정점 버퍼
+    Geometry->VertexCount = (UINT)Vertices.size();
+    const UINT VBByteSize = Geometry->VertexCount * sizeof(QuadPatchVertex);
+
+    Geometry->VertexBuffer = d3dUtil::CreateDefaultBuffer(m_D3dDevice.Get(), m_CommandList.Get(), Vertices.data(), VBByteSize, Geometry->VertexUploadBuffer);
+
+    Geometry->VertexBufferView.BufferLocation = Geometry->VertexBuffer->GetGPUVirtualAddress();
+    Geometry->VertexBufferView.StrideInBytes = sizeof(QuadPatchVertex);
+    Geometry->VertexBufferView.SizeInBytes = VBByteSize;
+
+    // 인덱스 버퍼
+    Geometry->IndexCount = (UINT)Indices.size();
+    const UINT IBByteSize = Geometry->IndexCount * sizeof(std::int32_t);
+
+    Geometry->IndexBuffer = d3dUtil::CreateDefaultBuffer(m_D3dDevice.Get(), m_CommandList.Get(), Indices.data(), IBByteSize, Geometry->IndexUploadBuffer);
+
+    Geometry->IndexBufferView.BufferLocation = Geometry->IndexBuffer->GetGPUVirtualAddress();
+    Geometry->IndexBufferView.Format = DXGI_FORMAT_R32_UINT;
+    Geometry->IndexBufferView.SizeInBytes = IBByteSize;
+
+    m_Geometries[Geometry->Name] = std::move(Geometry);
+}
+
+void D3DSample::CreateTreeGeometry()
+{
+    static const int TreeCount = 32;
+    std::array<TreeVertex, TreeCount> Vertices;
+    for (UINT i = 0; i < TreeCount; ++i)
+    {
+        float x = MathHelper::RandF(-45.0f, 45.0f);
+        float z = MathHelper::RandF(-45.0f, 50.0f);
+        float y = 4.0f;
+
+        Vertices[i].Pos = XMFLOAT3(x, y, z);
+        Vertices[i].Size = XMFLOAT2(10.0f, 10.0f);
+    }
+
+    std::array<std::int32_t, TreeCount> Indices;
+    for (UINT i = 0; i < TreeCount; ++i)
+    {
+        Indices[i] = i;
+    }
+
+    auto Geometry = std::make_unique<GeometryInfo>();
+    Geometry->Name = TEXT("Tree");
+
+    // 정점 버퍼
+    Geometry->VertexCount = (UINT)Vertices.size();
+    const UINT VBByteSize = Geometry->VertexCount * sizeof(TreeVertex);
+
+    Geometry->VertexBuffer = d3dUtil::CreateDefaultBuffer(m_D3dDevice.Get(), m_CommandList.Get(), Vertices.data(), VBByteSize, Geometry->VertexUploadBuffer);
+
+    Geometry->VertexBufferView.BufferLocation = Geometry->VertexBuffer->GetGPUVirtualAddress();
+    Geometry->VertexBufferView.StrideInBytes = sizeof(TreeVertex);
+    Geometry->VertexBufferView.SizeInBytes = VBByteSize;
+
+    // 인덱스 버퍼
+    Geometry->IndexCount = (UINT)Indices.size();
+    const UINT IBByteSize = Geometry->IndexCount * sizeof(std::int32_t);
+
+    Geometry->IndexBuffer = d3dUtil::CreateDefaultBuffer(m_D3dDevice.Get(), m_CommandList.Get(), Indices.data(), IBByteSize, Geometry->IndexUploadBuffer);
+
+    Geometry->IndexBufferView.BufferLocation = Geometry->IndexBuffer->GetGPUVirtualAddress();
+    Geometry->IndexBufferView.Format = DXGI_FORMAT_R32_UINT;
+    Geometry->IndexBufferView.SizeInBytes = IBByteSize;
+
+    m_Geometries[Geometry->Name] = std::move(Geometry);
+
+}
+
+void D3DSample::CreateQuadGeometry()
+{
+    GeometryGenerator GeoGenerator;
+    GeometryGenerator::MeshData Mesh = GeoGenerator.CreateQuad(0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+
+    std::vector<Vertex> Vertices(Mesh.Vertices.size());
+    for (size_t i = 0; i < Mesh.Vertices.size(); ++i)
+    {
+        Vertices[i].Pos = Mesh.Vertices[i].Position;
+        Vertices[i].Normal = Mesh.Vertices[i].Normal;
+        Vertices[i].Uv = Mesh.Vertices[i].TexC;
+        Vertices[i].TangentU = Mesh.Vertices[i].TangentU;
+    }
+
+    std::vector<std::int32_t> Indices;
+    Indices.insert(Indices.end(), std::begin(Mesh.Indices32), std::end(Mesh.Indices32));
+
+    auto Geometry = std::make_unique<GeometryInfo>();
+    Geometry->Name = TEXT("Quad");
+
+    // 정점 버퍼
+    Geometry->VertexCount = (UINT)Vertices.size();
+    const UINT VBByteSize = Geometry->VertexCount * sizeof(Vertex);
+
+    Geometry->VertexBuffer = d3dUtil::CreateDefaultBuffer(m_D3dDevice.Get(), m_CommandList.Get(), Vertices.data(), VBByteSize, Geometry->VertexUploadBuffer);
+
+    Geometry->VertexBufferView.BufferLocation = Geometry->VertexBuffer->GetGPUVirtualAddress();
+    Geometry->VertexBufferView.StrideInBytes = sizeof(Vertex);
+    Geometry->VertexBufferView.SizeInBytes = VBByteSize;
+
+    // 인덱스 버퍼
+    Geometry->IndexCount = (UINT)Indices.size();
+    const UINT IBByteSize = Geometry->IndexCount * sizeof(std::int32_t);
+
+    Geometry->IndexBuffer = d3dUtil::CreateDefaultBuffer(m_D3dDevice.Get(), m_CommandList.Get(), Indices.data(), IBByteSize, Geometry->IndexUploadBuffer);
+
+    Geometry->IndexBufferView.BufferLocation = Geometry->IndexBuffer->GetGPUVirtualAddress();
+    Geometry->IndexBufferView.Format = DXGI_FORMAT_R32_UINT;
+    Geometry->IndexBufferView.SizeInBytes = IBByteSize;
+
+    m_Geometries[Geometry->Name] = std::move(Geometry);
+}
+
 void D3DSample::UpdateObjectCB(float deltaTime)
 {
     for (size_t i = 0; i < m_RenderItems.size(); ++i)
@@ -928,11 +1348,12 @@ void D3DSample::UpdateObjectCB(float deltaTime)
 
 void D3DSample::UpdatePassCB(float deltaTime)
 {
-    XMMATRIX View = XMLoadFloat4x4(&m_View);
-    XMMATRIX Proj = XMLoadFloat4x4(&m_Proj);
+    XMMATRIX View = m_Camera.GetView();
+    XMMATRIX Proj = m_Camera.GetProj();
     XMMATRIX InvView = XMMatrixInverse(&XMMatrixDeterminant(View), View);
     XMMATRIX InvProj = XMMatrixInverse(&XMMatrixDeterminant(Proj), Proj);
     XMMATRIX ViewProj = XMMatrixMultiply(View, Proj);
+    XMMATRIX ShadowTransform = XMLoadFloat4x4(&m_ShadowTransform);
 
     PassConstant PassCB;
     XMStoreFloat4x4(&PassCB.View, XMMatrixTranspose(View));
@@ -940,22 +1361,23 @@ void D3DSample::UpdatePassCB(float deltaTime)
     XMStoreFloat4x4(&PassCB.InvView, XMMatrixTranspose(InvView));
     XMStoreFloat4x4(&PassCB.InvProj, XMMatrixTranspose(InvProj));
     XMStoreFloat4x4(&PassCB.ViewProj, XMMatrixTranspose(ViewProj));
+    XMStoreFloat4x4(&PassCB.ShadowTransform, XMMatrixTranspose(ShadowTransform));
 
     PassCB.AmbientLight = { 0.25f, 0.25f, 0.35f, 1.0f };
-    PassCB.EyePosW = m_EyePos;
-    PassCB.LightCount = 3;
+    PassCB.EyePosW = m_Camera.GetPosition3f();
+    PassCB.LightCount = 1;
 
     PassCB.Lights[0].LightType = 0;
-    PassCB.Lights[0].Direction = { 0.57735f, -0.57735f, 0.57735f };
+    PassCB.Lights[0].Direction = m_RotatedLightDirection;
     PassCB.Lights[0].Strength = { 0.6f, 0.6f, 0.6f };
 
-    PassCB.Lights[1].LightType = 0;
-    PassCB.Lights[1].Direction = { -0.57735f, -0.57735f, 0.57735f };
-    PassCB.Lights[1].Strength = { 0.3f, 0.3f, 0.3f };
+    //PassCB.Lights[1].LightType = 0;
+    //PassCB.Lights[1].Direction = { -0.57735f, -0.57735f, 0.57735f };
+    //PassCB.Lights[1].Strength = { 0.3f, 0.3f, 0.3f };
 
-    PassCB.Lights[2].LightType = 0;
-    PassCB.Lights[2].Direction = { 0.0f, -0.707f, -0.707f };
-    PassCB.Lights[2].Strength = { 0.15f, 0.15f, 0.15f };
+    //PassCB.Lights[2].LightType = 0;
+    //PassCB.Lights[2].Direction = { 0.0f, -0.707f, -0.707f };
+    //PassCB.Lights[2].Strength = { 0.15f, 0.15f, 0.15f };
 
 
 
@@ -979,6 +1401,86 @@ void D3DSample::UpdateMaterialCB(float deltaTime)
         UINT MaterialByteSize = (sizeof(MatConstant) + 255) & ~255;
         memcpy(&m_MaterialMappedData[MaterialIndex * MaterialByteSize], &MaterialCB, sizeof(MaterialCB));
     }
+}
+
+void D3DSample::UpdateShadowMapPassCB(float deltaTime)
+{
+    PassConstant ShadowMapPassCB;
+
+    XMMATRIX View = XMLoadFloat4x4(&m_LightView);
+    XMMATRIX Proj = XMLoadFloat4x4(&m_LightProj);
+    XMMATRIX ViewProj = XMMatrixMultiply(View, Proj);
+
+    XMMATRIX InvView = XMMatrixInverse(&XMMatrixDeterminant(View), View);
+    XMMATRIX InvProj = XMMatrixInverse(&XMMatrixDeterminant(Proj), Proj);
+
+    XMStoreFloat4x4(&ShadowMapPassCB.View, XMMatrixTranspose(View));
+    XMStoreFloat4x4(&ShadowMapPassCB.InvView, XMMatrixTranspose(InvView));
+    XMStoreFloat4x4(&ShadowMapPassCB.Proj, XMMatrixTranspose(Proj));
+    XMStoreFloat4x4(&ShadowMapPassCB.InvProj, XMMatrixTranspose(InvProj));
+    XMStoreFloat4x4(&ShadowMapPassCB.ViewProj, XMMatrixTranspose(ViewProj));
+
+    ShadowMapPassCB.EyePosW = m_LightPosW;
+
+    UINT PassCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(PassConstant));
+    memcpy(&m_PassMappedData[1 * PassCBByteSize], &ShadowMapPassCB, sizeof(PassConstant));
+}
+
+void D3DSample::UpdateCamera(float deltaTime)
+{
+    if (GetAsyncKeyState('W') & 0x8000)
+        m_Camera.Walk(10.0f * deltaTime);
+    if (GetAsyncKeyState('S') & 0x8000)
+        m_Camera.Walk(-10.0f * deltaTime);
+    if (GetAsyncKeyState('A') & 0x8000)
+        m_Camera.Strafe(-10.0f * deltaTime);
+    if (GetAsyncKeyState('D') & 0x8000)
+        m_Camera.Strafe(10.0f * deltaTime);
+
+    m_Camera.UpdateViewMatrix();
+}
+
+void D3DSample::UpdateLight(float deltaTime)
+{
+    m_LightRotationAngle += m_LightRotationSpeed * deltaTime;
+
+    XMMATRIX R = XMMatrixRotationY(m_LightRotationAngle);
+    XMVECTOR lightDir = XMLoadFloat3(&m_BaseLightDirection);
+    lightDir = XMVector3TransformNormal(lightDir, R);
+    XMStoreFloat3(&m_RotatedLightDirection, lightDir);
+
+    XMVECTOR lightPos = -2.0f * m_SceneBounds.Radius * lightDir;
+    XMVECTOR targetPos = XMLoadFloat3(&m_SceneBounds.Center);
+    XMVECTOR lightUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    XMMATRIX lightView = XMMatrixLookAtLH(lightPos, targetPos, lightUp);
+    XMStoreFloat3(&m_LightPosW, lightPos);
+
+    XMFLOAT3 SphereCenterLS;
+    XMStoreFloat3(&SphereCenterLS, XMVector3Transform(targetPos, lightView));
+
+    float left = SphereCenterLS.x - m_SceneBounds.Radius;
+    float right = SphereCenterLS.x + m_SceneBounds.Radius;
+    float bottom = SphereCenterLS.y - m_SceneBounds.Radius;
+    float top = SphereCenterLS.y + m_SceneBounds.Radius;
+    float nearZ = SphereCenterLS.z - m_SceneBounds.Radius;
+    float farZ = SphereCenterLS.z + m_SceneBounds.Radius;
+
+    XMMATRIX lightProj = XMMatrixOrthographicOffCenterLH(left, right, bottom, top, nearZ, farZ);
+
+    m_LightNearZ = nearZ;
+    m_LighFarZ = farZ;
+
+    XMStoreFloat4x4(&m_LightView, lightView);
+    XMStoreFloat4x4(&m_LightProj, lightProj);
+
+    XMMATRIX T(
+        0.5f,  0.0f, 0.0f, 0.0f,
+        0.0f, -0.5f, 0.0f, 0.0f,
+        0.0f,  0.0f, 1.0f, 0.0f,
+        0.5f,  0.5f, 0.0f, 1.0f);
+
+    XMMATRIX S = lightView * lightProj * T;
+    XMStoreFloat4x4(&m_ShadowTransform, S);
 }
 
 void D3DSample::RenderGeometry()
@@ -1054,9 +1556,44 @@ void D3DSample::RenderGeometry(const std::vector<RenderItem*>& RenderItems)
         // 정점 인덱스 토폴로지 연결
         m_CommandList->IASetVertexBuffers(0, 1, &RenderItem->Geometry->VertexBufferView);
         m_CommandList->IASetIndexBuffer(&RenderItem->Geometry->IndexBufferView);
-        m_CommandList->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_CommandList->IASetPrimitiveTopology(RenderItem->PrimitiveType);
 
         // 렌더링
         m_CommandList->DrawIndexedInstanced(RenderItem->Geometry->IndexCount, 1, 0, 0, 0);
     }
+}
+
+void D3DSample::RenderSceneToShadowMap()
+{
+    m_CommandList->SetGraphicsRootSignature(m_RootSignature.Get());
+
+    m_CommandList->RSSetViewports(1, &m_ShadowMapViewport);
+    m_CommandList->RSSetScissorRects(1, &m_ShadowMapSicssorRect);
+
+    m_CommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        m_ShadowMapResource.Get(),
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE));
+
+    m_CommandList->ClearDepthStencilView(m_hShadowMapDsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+
+    m_CommandList->OMSetRenderTargets(0, nullptr, false, &m_hShadowMapDsv);
+
+    // 텍스처 서술자 렌더링 파이프라인에 묶기
+    ID3D12DescriptorHeap* DescritprHeaps[] = { m_TextureDescriptorHeap.Get() };
+    m_CommandList->SetDescriptorHeaps(_countof(DescritprHeaps), DescritprHeaps);
+
+    // 그림자 맵 공용 상수 버퍼
+    UINT PassCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(PassConstant));
+    D3D12_GPU_VIRTUAL_ADDRESS PassCBAddress = m_PassCB->GetGPUVirtualAddress() + PassCBByteSize;
+    m_CommandList->SetGraphicsRootConstantBufferView(1, PassCBAddress);
+
+    // Opaque 오브젝트 렌더링
+    m_CommandList->SetPipelineState(m_PipelineStates[RenderLayer::ShadowMap].Get());
+    RenderGeometry(m_RenderItemLayer[(int)RenderLayer::Opaque]);
+
+    m_CommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        m_ShadowMapResource.Get(),
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        D3D12_RESOURCE_STATE_GENERIC_READ));
 }
